@@ -1,0 +1,1111 @@
+;---------------------------------------------------------------------
+;
+; 32000 Hz : 110 clock
+; 22050 Hz : 161 clock
+; 16000 Hz : 221 clock
+; 13400 Hz : 264 clock
+; 11025 Hz : 321 clock
+;  8000 Hz : 443 clock
+;
+;Z80A (3.58MHz/NTSC、3.54MHz/PAL) 
+;Z80メモリ 8KB
+;254サイクル/サンプル
+;22050Hz 162
+;11025Hz 324
+
+;---------------------------------------------------------------------
+A_SP:		EQU		2000h
+BANK:		EQU		6000h
+YM_REG:		EQU		4000h
+YM_DAT:		EQU		4001h
+PSG_PORT:	EQU		7F11h
+
+FMBUFF		EQU		$1A00			; 256byte(100H)
+FMBUFF_H	EQU		$1A
+FMBUFF_BH	EQU		$1D
+VOLTBL		EQU		$0A00			; 256byte(100H)
+VOLTBL_H	EQU		$0A
+WAVBUFFER0  EQU		$1E00			; WAV buffer 0
+WAVBUFFER0_H EQU	$1E				; WAV buffer 0
+
+;---------------------------------------------------------------------
+		ORG	$0000
+		DI			;割り込み禁止
+		LD	SP, A_SP	;スタックポインタ初期化
+		IM	1		;割り込みMODE 1
+;;		EI
+		JP	INIT		;RESET
+
+;---------------------------------------------------------------------
+		BLOCK $0038-$
+		/*
+		PUSH HL
+		LD HL,(VSYNC_C)
+		INC HL
+		LD (VSYNC_C),HL
+		POP HL
+		EI
+		*/
+		RETI			;VSYNC割り込み
+
+;---------------------------------------------------------------------
+;60 80 a0 c0 e0
+CNL0			EQU		$60
+CNL_IN_START	EQU		0	//3byte 入力:開始アドレス
+CNL_IN_END		EQU		3	//3byte 入力:終了アドレス
+CNL_IN_ADD_L	EQU		6	//2byte 入力:加算値Low
+CNL_IN_ADD_H	EQU		9	//2byte 入力:加算値High
+CNL_NOW_ADR		EQU		12	//3byte 現在のアドレス
+CNL_NOW_ADR_L	EQU		14	//3byte 現在のアドレス
+CNL_END_ADR		EQU		15	//3byte 終了アドレス
+CNL_ADD_L		EQU		18	//2byte 加算値Low
+CNL_ADD_H		EQU		21	//2byte 加算値High
+CNL_PLAY_FLG	EQU		24	//1byte 再生フラグ
+CNL_VOL			EQU		26	//1byte ボリューム
+CNL_NEXT_TMP	EQU		27	//1byte 次のアドレス(テンポラリ)
+CNL_SIZE		EQU		32	//サイズ
+
+;---------------------------------------------------------------------
+		BLOCK $50-$
+FMOUT1:			DW	0		//0x00 FM出力アドレス
+FMREAD1:		DW	0		//0x02 FM読み込みアドレス
+PAN1:			DW	3		//0x04 PAN
+MUTE_ADR		DW	0		//0x06 ミュートデータアドレス
+PCMOUT1:		DW	0		//0x08 PCM出力アドレス
+				DW	0		//0x0a
+				DW	0		//0x0c
+				DW	0		//0x0e
+
+;---------------------------------------------------------------------
+		;==========================
+		;ウェイト
+		;clock 16*n
+		;==========================
+		macro Wait n
+		LD		A,n
+.Wait_01
+		DEC		A				;4
+		JP		NZ,.Wait_01		;12
+		endm
+		;==========================
+		;PCM出力初期化
+		;clock 
+		;==========================
+		macro EnableDAC
+		LD	A, 2Bh		;FM6無効, PCM有効
+		LD	(YM_REG), A
+		LD	A, 80h
+		LD	(YM_DAT), A
+		LD	A, 2Ah		;PCMデータレジスタを選択
+		LD	(YM_REG), A
+		endm
+		;==========================
+		;PCM出力初期化
+		;clock 
+		;==========================
+		macro InitPcmOut
+		EXX						; 4
+		LD		B,0
+		LD		HL,WAVBUFFER0
+		XOR		A
+.InitPcmOut_01
+		LD		(HL),A
+		DJNZ	.InitPcmOut_01
+		LD		H,WAVBUFFER0_H 
+		LD		L,80H
+		LD		DE,YM_DAT
+		EXX						; 4
+		endm
+		;==========================
+		;PCM出力
+		;clock 33
+		;==========================
+		macro PcmOut
+		EXX						; 4
+		LD		A,(HL)			; 7 PCMデータ読み込み
+		INC		L				; 4
+		ADD		80h				; 7
+		LD		(DE), A			; 7 DACへ出力
+		EXX						; 4
+		endm
+		;==========================
+		;バンク切り替え
+		;clock 124
+		;==========================
+		macro SetBank
+		LD	HL, BANK		;10 バンクセレクト
+		LD	(HL), A			;10 bit 15
+		RRCA				;4
+		LD	(HL), A			;10 bit 16
+		RRCA				;4
+		LD	(HL), A			;10 bit 17
+		RRCA				;4
+		LD	(HL), A			;10 bit 18
+		RRCA				;4
+		LD	(HL), A			;10 bit 19
+		RRCA				;4
+		LD	(HL), A			;10 bit 20
+		RRCA				;4
+		LD	(HL), A			;10 bit 21
+		LD	(HL), L			;10 bit 22
+		LD	(HL), L			;10 bit 23
+		endm
+		
+		;==========================
+		;チャネル初期化
+		;clock 165
+		;==========================
+		macro InitParamCnl ch
+		LD		A,-1										; 7 再生中フラグ
+		LD		((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG),A			;13
+		LD		A,15										;
+		LD		((CNL0+ch*CNL_SIZE)+CNL_VOL),A				;13
+		LD		HL,0
+		LD		((CNL0+ch*CNL_SIZE)+CNL_IN_ADD_L+0),HL		;16
+		LD		((CNL0+ch*CNL_SIZE)+CNL_IN_ADD_H+0),HL		;16
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_L+0),HL			;16
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_H+0),HL			;16
+		LD		HL,(MUTE_ADR)
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0),HL		;16
+		INC		L
+		LD		((CNL0+ch*CNL_SIZE)+CNL_END_ADR+0),HL		;16
+		XOR		A											; 4
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR_L+0),A		;13
+		endm
+		;==========================
+		;パラメータのフィードバック
+		;clock 165
+		;==========================
+		macro FeedbackParamCnl ch
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG)			;13
+		OR		A
+		JP		S,.FeedbackParamCnl_02						;-1はスキップ
+		JP		NZ,.FeedbackParamCnl_01
+		; ** stop **
+		LD		A,-1										; 7 再生中フラグ
+		LD		((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG),A			;13
+		LD		HL,0
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_L+0),HL			;16
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_H+0),HL			;16
+		JP		.FeedbackParamCnl_02
+.FeedbackParamCnl_01
+		; ** play **
+		LD		A,-1										; 7 再生中フラグ
+		LD		((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG),A			;13
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_IN_START+0)		;16 再生位置獲得
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0),HL		;16
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_IN_END+0)		;16 終了位置獲得
+		LD		((CNL0+ch*CNL_SIZE)+CNL_END_ADR+0),HL		;16
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_IN_ADD_L+0)		;16
+		
+	LD L,0
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_L+0),HL			;16
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_IN_ADD_H+0)		;16
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_H+0),HL			;16
+		XOR		A											; 4
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR_L+0),A		;13
+		
+;;		LD		HL,0
+;;		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_L+0),HL			;16
+;;		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_H+0),HL			;16
+.FeedbackParamCnl_02
+		endm
+		
+		
+		
+;---------------------------------------------------------------------
+;---------------------------------------------------------------------
+		;==========================
+		;チャネルのバンク設定
+		;clcok
+		;==========================
+		macro SetBankCnl ch
+		LD	A, ((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+1)
+		SetBank
+		endm
+		;==========================
+		;前処理サブ
+		;31clock
+		;==========================
+		macro PrevFixNoteCnlSub ch
+		SetBankCnl ch
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_VOL+0)			;13 ボリュームテーブル獲得
+		LD		B,A
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0)		;HL PCMアドレス
+		endm
+		
+		;==========================
+		;HLにPCM出力アドレス設定
+		;==========================
+		macro SetPcmBank_HL
+		LD		A,(PCMOUT1)
+		LD		H,WAVBUFFER0_H
+		LD		L,A
+		endm
+		
+		;==========================
+		;DEにPCM出力アドレス設定
+		;==========================
+		macro SetPcmBank_DE
+		LD		A,(PCMOUT1)
+		LD		D,WAVBUFFER0_H
+		LD		E,A
+		endm
+		
+		;==========================
+		;前処理
+		;31clock
+		;==========================
+		macro PrevFixNoteCnl_HL ch
+		PrevFixNoteCnlSub ch
+		LD		H,A
+		;LD		L,0
+		LD		A,(PCMOUT1)
+		XOR		A,80H
+		LD		L,A
+		SetPcmBank_DE
+		endm
+		
+		;==========================
+		;前処理
+		;31clock
+		;==========================
+		macro PrevFixNoteCnl_DE ch
+		PrevFixNoteCnlSub ch
+		LD		D,A
+		;LD		E,0
+		LD		A,(PCMOUT1)
+		XOR		A,80H
+		LD		E,A
+		SetPcmBank_HL
+		endm
+		
+		;==========================
+		;PCM出力アドレスのフリップ
+		;==========================
+		macro FlipPcmOut
+		LD		A,(PCMOUT1)
+		XOR		A,80H
+		LD		(PCMOUT1),A
+		endm
+		
+		;==========================
+		;PCM転送
+		;31*4=124 64loop
+		;31*5=155 52loop
+		;31clock
+		;==========================
+		macro FixNoteMoveCnl_HL
+		LD		C,(HL)						; 7 PCMデータ読み込み
+		INC		HL							; 6
+		LD		A,(BC)						; 7 ボリューム変換
+		LD		(DE),A						; 7
+		INC		E							; 4
+		endm
+		
+		;==========================
+		;PCMミックス
+		;52*2=104 128loop
+		;52*3=156 86loop
+		;52clock
+		;==========================
+		macro FixNoteMixCnl_DE
+		LD		A,(DE)						; 7 PCMデータ読み込み
+		LD		C,A							; 4
+		INC		DE							; 6
+		LD		A,(BC)						; 7 ボリューム変換
+		ADD		A,(HL)						; 7
+		JP		PO,.FixPcmCnl_01			;10
+		LD		A,80H						;(4)
+		ADC		A,$FF						;(4)
+.FixPcmCnl_01
+		LD		(HL),A						; 7
+		INC		L							; 4
+		endm
+		
+		;==========================
+		;PCMミックス
+		;56clock
+		;==========================
+		macro FixNoteMixCnl_HL
+		LD		C,(HL)						; 7 PCMデータ読み込み
+		INC		HL							; 6
+		LD		A,(BC)						; 7 ボリューム変換
+		LD		C,A							; 4
+		LD		A,(DE)						; 7
+		ADD		A,C							; 4
+		JP		PO,.FixPcmCnl_01			;10
+		LD		A,80H						;(4)
+		ADC		A,$FF						;(4)
+.FixPcmCnl_01
+		LD		(DE),A						; 7
+		INC		E							; 4
+		endm
+		
+		;==========================
+		;ミュートアドレスの設定
+		;clock
+		;==========================
+		macro MuteAdrPcmCnl ch
+		LD		HL,(MUTE_ADR)
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0),HL
+		INC		L
+		LD		((CNL0+ch*CNL_SIZE)+CNL_END_ADR+0),HL
+		endm
+		
+		
+		;==========================
+		;ミュート加算値設定
+		;clock
+		;==========================
+		macro MuteAddPcmCnl ch
+		LD		HL,0
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_L+0),HL			;16
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_H+0),HL			;16
+		endm
+		
+		;==========================
+		;次のアドレスへ
+		;clock
+		;==========================
+		macro FixNoteNextAdr ch
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR)		;次の256
+		INC		L										;low+1
+		LD		A,L										;<80Hになった?
+		OR		A
+		JP		NZ,.FixNoteNextAdr_01
+		LD		L,80h									;low=80H
+		INC		H										;high++
+.FixNoteNextAdr_01
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR),HL
+		/*
+		LD		DE,((CNL0+ch*CNL_SIZE)+CNL_END_ADR)		;PCM終了?
+		LD		A,H
+		CP		D
+		JP		NZ,.FixNoteNextAdr_02
+		LD		A,L
+		CP		E
+		JP		NZ,.FixNoteNextAdr_02
+		*/
+		LD		BC,((CNL0+ch*CNL_SIZE)+CNL_END_ADR)		;PCM終了?
+		LD		A,H
+		CP		B
+		JP		NZ,.FixNoteNextAdr_02
+		LD		A,L
+		CP		C
+		JP		NZ,.FixNoteNextAdr_02
+		
+		MuteAdrPcmCnl ch
+		;;MuteAddPcmCnl ch
+.FixNoteNextAdr_02
+		endm
+		
+		
+		
+		;==========================
+		;31*4=124
+		;124+33+4+16=177
+		;20225Hz
+		;clock
+		;==========================
+		macro FixNoteMoveCnl_Rept4 ch
+		LD	IYL,32
+		FeedbackParamCnl ch
+		PrevFixNoteCnl_HL ch
+.FixNoteMoveCnl_01
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		PcmOut							;33
+		DEC IYL							; 4
+		JP NZ,.FixNoteMoveCnl_01		;7/12
+		FixNoteNextAdr ch
+		endm
+		
+		;==========================
+		;31*5=155
+		;155+33+4+16=208
+		;17211Hz
+		;clock
+		;==========================
+		macro FixNoteMoveCnl_Rept5 ch
+		LD	IYL,25
+		FeedbackParamCnl ch
+		PrevFixNoteCnl_HL ch
+.FixNoteMoveCnl_01b
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		PcmOut							;33
+		DEC IYL							; 4
+		JP NZ,.FixNoteMoveCnl_01b		;7/12
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteMoveCnl_HL				;31clock
+		FixNoteNextAdr ch
+		endm
+		
+		;==========================
+		;
+		;clock
+		;==========================
+		macro FixNoteMixCnl_Rept2 ch
+		LD	IYL,64
+		FeedbackParamCnl ch
+		PrevFixNoteCnl_HL ch
+.FixNoteMixCnl_01
+		FixNoteMixCnl_HL
+		FixNoteMixCnl_HL
+		PcmOut							;33
+		DEC IYL							; 4
+		JP NZ,.FixNoteMixCnl_01			;7/12
+		FixNoteNextAdr ch
+		endm
+		
+		macro FixNoteMixCnl_Rept2_DE ch
+		LD	IYL,64
+		FeedbackParamCnl ch
+		PrevFixNoteCnl_DE ch
+.FixNoteMixCnl_01
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		PcmOut							;33
+		DEC IYL							; 4
+		JP NZ,.FixNoteMixCnl_01			;7/12
+		FixNoteNextAdr ch
+		endm
+		
+		;==========================
+		;
+		;clock
+		;==========================
+		macro FixNoteMixCnl_Rept3 ch
+		LD	IYL,42
+		FeedbackParamCnl ch
+		PrevFixNoteCnl_HL ch
+.FixNoteMixCnl_01b
+		FixNoteMixCnl_HL
+		FixNoteMixCnl_HL
+		FixNoteMixCnl_HL
+		PcmOut							;33
+		DEC IYL							; 4
+		JP NZ,.FixNoteMixCnl_01b		;7/12
+		FixNoteMixCnl_HL
+		FixNoteMixCnl_HL
+		FixNoteNextAdr ch
+		endm
+		
+		macro FixNoteMixCnl_Rept3_DE ch
+		LD	IYL,42
+		FeedbackParamCnl ch
+		PrevFixNoteCnl_DE ch
+.FixNoteMixCnl_01b
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		PcmOut							;33
+		DEC IYL							; 4
+		JP NZ,.FixNoteMixCnl_01b		;7/12
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		FixNoteNextAdr ch
+		endm
+		
+		;52*4=208
+		;208+33+16=257
+		;13930Hz
+		macro FixNoteMixCnl_Rept4_DE ch
+		LD	IYL,32
+		FeedbackParamCnl ch
+		PrevFixNoteCnl_DE ch
+.FixNoteMixCnl_01b
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		PcmOut							;33
+		DEC IYL							; 4
+		JP NZ,.FixNoteMixCnl_01b		;7/12
+		FixNoteNextAdr ch
+		endm
+		
+		;==========================
+		;
+		;clock
+		;==========================
+		macro FixNoteMixCnl_Rept3_DE_W11 ch
+		LD	IYL,42
+		FeedbackParamCnl ch
+		PrevFixNoteCnl_DE ch
+.FixNoteMixCnl_01b
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		PcmOut							;33
+		DEC IYL							; 4
+		JP NZ,.FixNoteMixCnl_01b		;7/12
+		FixNoteMixCnl_DE
+		FixNoteMixCnl_DE
+		FixNoteNextAdr ch
+		endm
+		
+		;==========================
+		;
+		;clock
+		;==========================
+		macro PcmOutLoop cnt,wt
+		LD	IYL,cnt
+.PcmOutLoop_01
+		Wait wt
+		PcmOut
+		DEC IYL							; 4
+		JP NZ,.PcmOutLoop_01			;7/12
+		endm
+		
+		
+		
+		
+;---------------------------------------------------------------------
+		BLOCK $100-$
+INIT:	
+		LD	HL,FMBUFF
+		LD	(FMOUT1),HL
+		LD	(FMREAD1),HL
+		LD	A,$c0
+		LD	(PAN1),A
+		LD	A,0
+		LD	(PCMOUT1),A
+		InitPcmOut
+		InitParamCnl 0
+		InitParamCnl 1
+		InitParamCnl 2
+		InitParamCnl 3
+		CALL FMOUTPUT
+		EnableDAC
+INIT_10:
+INIT_20:
+		JP	LOOP_100
+		;JP LOOP_200_A
+		;JP LOOP_200_B
+		;JP	LOOP_300
+		;JP	LOOP_400
+		
+;---------------------------------------------------------------------
+;	FMデータ出力
+;---------------------------------------------------------------------
+FMOUTPUT:
+		LD	BC,(FMOUT1)
+		LD	DE,(FMREAD1)
+		;初回の終了チェック
+		LD		A,B
+		CP		D
+		JP		NZ,FMOUTPUT_02
+		LD		A,C
+		CP		E
+		JP		NZ,FMOUTPUT_02
+		RET
+		;2回目以降の終了チェック
+FMOUTPUT_01:
+		LD		A,B
+		CP		D
+		JP		NZ,FMOUTPUT_02
+		LD		A,C
+		CP		E
+		JP		NZ,FMOUTPUT_02
+		LD	(FMREAD1),DE
+		;DAC有効
+		EnableDAC
+		RET
+FMOUTPUT_02:
+		LD	HL,YM_REG
+FMOUTPUT_03:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,FMOUTPUT_03
+		
+		LD	A,(DE)
+		INC	DE
+		ADD	A,A
+		LD	L,A
+		
+		LD	A,(DE)
+		INC	DE
+		LD	(HL), A
+		
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		
+FMOUTPUT_04:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,FMOUTPUT_03
+		
+		LD	A,(DE)
+		INC	DE
+		INC	HL
+		LD	(HL), A
+		
+		LD	A,D
+		CP	A,FMBUFF_BH
+		JP	NZ,FMOUTPUT_05
+		LD	D,FMBUFF_H
+FMOUTPUT_05:
+		
+		JP	FMOUTPUT_01
+		
+
+;---------------------------------------------------------------------
+;	
+;---------------------------------------------------------------------
+OUTREG1:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,OUTREG1
+		LD	A,D
+		LD	(YM_REG+0),A
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+OUTREG1_01:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,OUTREG1_01
+		LD	A,E
+		LD	(YM_REG+1),A
+		RET
+		
+OUTREG2:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,OUTREG2
+		LD	A,D
+		LD	(YM_REG+2),A
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+OUTREG2_01:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,OUTREG2_01
+		LD	A,E
+		LD	(YM_REG+3),A
+		RET
+;---------------------------------------------------------------------
+;	タイマー設定
+;---------------------------------------------------------------------
+;タイマーA設定
+SET_TIMERA:
+		LD	D,24H
+		LD	E,L
+		CALL OUTREG1
+		LD	D,25H
+		LD	E,H
+		CALL OUTREG1
+		RET
+;タイマーB設定
+SET_TIMERB:
+		LD	D,26H
+		LD	E,A
+		CALL OUTREG1
+		RET
+;タイマーフラグ設定
+		;OR	TIMER,00110101B
+SET_TIMER:
+		LD	D,27H
+		LD	E,A
+		CALL OUTREG1
+		RET
+
+;---------------------------------------------------------------------
+;	PAN出力
+;---------------------------------------------------------------------
+PANOUT:
+PANOUT_01:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,PANOUT_01
+		LD	A,0xb6
+		LD	(YM_REG+2),A
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+PANOUT_02:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,PANOUT_02
+		LD	A,(PAN1)
+		LD	(YM_REG+3),A
+		RET
+;---------------------------------------------------------------------
+;音程可変、音量可変 x1
+;音程固定、音量可変 x2
+;計3チャネル
+;13930Hz
+;---------------------------------------------------------------------
+
+LOOP_100:
+		FeedbackParamCnl 0
+		SetBankCnl 0
+		;
+		LD		A,(CNL0+CNL_NOW_ADR+0)		;HL PCMアドレス
+		LD		H,A
+		INC		A							;次のバンクアドレス
+		LD		(CNL0+CNL_NEXT_TMP+0),A
+		LD		A,(CNL0+CNL_NOW_ADR_L+0)
+		LD		L,A
+		
+		LD		A,(CNL0+CNL_VOL+0)			;13 ボリュームテーブル獲得
+		LD		(PG_VOL1+1),A
+		LD		(PG_VOL2+1),A
+		LD		A,(CNL0+CNL_ADD_L+1)
+		LD		(PG_ADD_L1+1),A
+		LD		(PG_ADD_L2+1),A
+		LD		A,(CNL0+CNL_ADD_H+0)
+		LD		(PG_ADD_H1+1),A
+		LD		(PG_ADD_H2+1),A
+		LD		A,(CNL0+CNL_NEXT_TMP+0)
+		LD		(PG_NEXT_TMP1+1),A
+		LD		(PG_NEXT_TMP2+1),A
+		
+		LD		IYH,0
+		LD		IYL,64
+		SetPcmBank_DE
+		;280
+LOOP_111:
+		;101*2=202clock
+		;------------------------------------------
+		;101clock
+		;HL  PCMデータアドレス整数部
+		;IYH PCMデータアドレス小数部
+		;DE  PCM出力アドレス
+PG_VOL1:
+		LD		B,VOLTBL_H+15				; 7 ボリューム値
+		LD		C,(HL)						; 7 PCMデータ読み込み
+		LD		A,(BC)						; 7 ボリューム変換
+		LD		(DE),A						; 7 PCM出力
+		INC		E							; 4 PCM出力アドレス+1
+		LD		A,IYH						; 8 アドレス小数点加算
+PG_ADD_L1:
+		ADD		A,0							; 7 小数点加算値
+		LD		IYH,A						; 8
+PG_ADD_H1:
+		LD		BC,0						;10 整数部加算値
+		ADC		HL,BC						;15 アドレス整数部加算
+		;@ 21
+PG_NEXT_TMP1:
+		LD	A,0								; 7 256byte分処理したか?
+		CP	H								; 4 
+		CALL Z,BANK_CHARER					;10 バンク切り替えと終了チェックへ
+		;------------------------------------------
+		;101clock
+PG_VOL2:
+		LD		B,VOLTBL_H+15				; 7
+		LD		C,(HL)						; 7 PCMデータ読み込み
+		LD		A,(BC)						; 7 ボリューム変換
+		LD		(DE),A						; 7
+		INC		E							; 4
+		LD		A,IYH						; 8
+PG_ADD_L2:
+		ADD		A,0							; 7
+		LD		IYH,A						; 8
+PG_ADD_H2:
+		LD		BC,0						;10
+		ADC		HL,BC						;15
+PG_NEXT_TMP2:
+		LD	A,0								; 7 256byte分処理したか?
+		CP	H								; 4
+		CALL Z,BANK_CHARER					;10 
+		;------------------------------------------
+		NOP
+		;
+		PcmOut								;33 clock
+		DEC IYL								; 4
+		JP NZ,LOOP_111						;7/12
+		;------------------------------------------
+		LD		A,H
+		LD		(CNL0+CNL_NOW_ADR+0),A
+		LD		A,L
+		LD		(CNL0+CNL_NOW_ADR_L+0),A
+		;------------------------------------------
+		FixNoteMixCnl_Rept4_DE 1			;32
+		FixNoteMixCnl_Rept4_DE 2			;32
+		;------------------------------------------
+		FlipPcmOut
+		CALL	FMOUTPUT			;FMデータ出力へ
+		JP LOOP_100
+		
+	;===========================================
+	;
+	;===========================================
+BANK_CHARER:
+		LD		A,L
+		LD		(CNL0+CNL_NOW_ADR_L+0),A
+		LD		HL,(CNL0+CNL_NOW_ADR+0)		;+100h
+		INC		L							;low+1
+		LD		A,L							;<80Hになった?
+		OR		A
+		JP		NZ,BANK_CHARER_01
+		LD		L,80h						;low=80H
+		INC		H							;high++
+BANK_CHARER_01:
+		LD		(CNL0+CNL_NOW_ADR+0),HL
+		LD		BC,(CNL0+CNL_END_ADR+0)		;PCM終了?
+		
+		LD		A,H
+		CP		B
+		JP		NZ,BANK_CHARER_02
+		LD		A,L
+		CP		C
+		JP		NZ,BANK_CHARER_02
+		;stop
+		MuteAdrPcmCnl 0
+		MuteAddPcmCnl 0
+		
+		LD		A,(CNL0+CNL_ADD_L+1)
+		LD		(PG_ADD_L1+1),A
+		LD		(PG_ADD_L2+1),A
+		LD		A,(CNL0+CNL_ADD_H+0)
+		LD		(PG_ADD_H1+1),A
+		LD		(PG_ADD_H2+1),A
+		LD		IYH,0
+		XOR		A
+		LD		(CNL0+CNL_NOW_ADR_L+0),A
+		LD		H,0
+BANK_CHARER_02:
+		LD	A, (CNL0+CNL_NOW_ADR+1)			;同じバンク?
+		CP	A,H
+		JP	Z,BANK_CHARER_03
+		SetBank
+BANK_CHARER_03:
+		LD		A,(CNL0+CNL_NOW_ADR+0)		;HL PCMアドレス
+		LD		H,A
+		INC		A							;次のバンクアドレス
+		LD		(CNL0+CNL_NEXT_TMP+0),A
+		LD		A,(CNL0+CNL_NOW_ADR_L+0)
+		LD		L,A
+		;
+		LD		A,(CNL0+CNL_NEXT_TMP+0)
+		LD		(PG_NEXT_TMP1+1),A
+		LD		(PG_NEXT_TMP2+1),A
+		RET
+
+;---------------------------------------------------------------------
+;音程固定、音量可変、2チャンネル
+;20225Hz
+;※256回す
+;---------------------------------------------------------------------
+/*
+LOOP_200_A:
+		FixNoteMoveCnl_Rept4 0		;32
+		FixNoteMixCnl_Rept2_DE 1	;64
+		PcmOutLoop 32,8				;32
+		FlipPcmOut
+		CALL	FMOUTPUT			;FMデータ出力へ
+		JP LOOP_200_A
+*/
+;---------------------------------------------------------------------
+;音程固定、音量可変、3チャンネル
+;17211Hz
+;※256回す
+;---------------------------------------------------------------------
+/*
+LOOP_200_B:
+		FixNoteMoveCnl_Rept5 0		;25
+		FixNoteMixCnl_Rept3_DE 1	;42
+		FixNoteMixCnl_Rept3_DE 2	;42
+		PcmOutLoop 19,10			;19
+		FlipPcmOut
+		CALL	FMOUTPUT			;FMデータ出力へ
+		JP LOOP_200_B
+*/
+;---------------------------------------------------------------------
+;	
+;---------------------------------------------------------------------
+/*
+LOOP_300:
+		LD	IYL,0
+		FeedbackParamCnl 0
+		PrevFixNoteCnl_HL 0
+LOOP_301:
+		FixNoteMoveCnl_HL				;31clock
+		PcmOut
+		Wait 8
+		DEC IYL							; 4
+		JP NZ,LOOP_301					;7/12
+		;
+		FixNoteNextAdr 0
+		CALL	FMOUTPUT			;FMデータ出力へ
+		JP LOOP_300
+*/
+;---------------------------------------------------------------------
+;	タイマーを使った発音
+;3.58MHz
+;3580
+;---------------------------------------------------------------------
+/*
+LOOP_400:
+		LD	A,255
+		;LD	A,128
+		CALL SET_TIMERB
+		
+;;		LD	HL,1023-5		; 8.879Hz()
+;;		LD	HL,1023-4		;10.655Hz(335clcok)
+		LD	HL,1023-3		;13.319Hz(268clock)
+;;		LD	HL,1023-2		;17.758Hz(201clock)
+;;		LD	HL,1023-1		;26.638Hz()
+;;		LD	HL,1023-0		;53.276Hz()
+		
+		LD	A,24H
+		LD	(YM_REG), A
+		;LD	A,0FEH
+		LD	A,L
+		RR H
+		RRA
+		RR H
+		RRA
+		LD	(YM_DAT), A
+		
+		LD	A,25H
+		LD	(YM_REG), A
+		;LD	A,0
+		LD	A,L
+		AND A,3
+		LD	(YM_DAT), A
+		
+		;LD	A,00101010B
+		;LD	A,00111111B
+		;CALL SET_TIMER
+		LD	A,27H
+		LD	(YM_REG), A
+		LD	A,3FH
+		LD	(YM_DAT), A
+		;
+		FeedbackParamCnl 0
+		;;PrevFixNoteCnl_HL 0
+		PrevFixNoteCnlSub 0
+		LD		H,A
+		LD		L,0
+		
+		LD	IYL,0
+		;;LD	IYL,128
+		
+LOOP_401:
+		LD		A, 2Ah						;PCMデータレジスタを選択
+		LD		(YM_REG), A
+
+		LD		C,(HL)					; 7 PCMデータ読み込み
+		INC		HL						; 6
+		;;INC		HL						; 6
+		LD		A,(BC)					; 7 ボリューム変換
+		ADD		80h						; 7
+		LD		(YM_DAT),A				; 7
+		
+LOOP_402:
+		LD	A,(YM_REG)
+		;RRCA
+		RRCA
+		JP	NC,LOOP_402
+		
+		;BIT	0,A
+		;JP	NZ,LOOP_402
+		;JP	Z,LOOP_402
+		;LD	A,00101010B
+		;LD	A,00111111B
+		;CALL SET_TIMER
+		
+		LD	A,27H
+		LD	(YM_REG), A
+		LD	A,3FH
+		LD	(YM_DAT), A
+		
+		;LD	A, 2Ah						;PCMデータレジスタを選択
+		;LD	(YM_REG), A
+		
+		
+		;;Wait 12
+		DEC IYL							; 4
+		JP NZ,LOOP_401					;7/12
+		FixNoteNextAdr 0
+		
+		FlipPcmOut
+		CALL	FMOUTPUT			;FMデータ出力へ
+		JP LOOP_400
+*/
+;-------------------------------------------------------------
+		DS		$100
+END	

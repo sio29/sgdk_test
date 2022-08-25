@@ -1,0 +1,223 @@
+;---------------------------------------------------------------------
+;SOUND DRIVER (C) Minami Youichi 09.23.2008 - 10.04.2008
+;
+;使う人居るか知らんけど、このサウンドドライバの使い方:
+;	このコードを 0xA00000(Z80のRAMエリア)に転送したら、
+;	あとは鳴らしたい時に以下のシーケンスを実行すればOK。
+;
+;	1. 0xA00010 にPCMスタートアドレスをぶち込む
+;	2. 0xA00014 にPCMエンドアドレスをぶち込む
+;	3. 0xA00015 に 0x00 をぶち込む
+;
+;	スタートアドレスとエンドアドレスがバンクを跨いでいると死ぬ。
+;	なのでバンク(32KBytes単位)を跨がない範囲に揃える必要がある。
+;
+;	PCMのフォーマットはYM2151のDACデータそのまんま。
+;
+;アセンブルの仕方:
+;	Zilogスタンダードな書き方したつもり。
+;	ZASMとかアブソリュートアセンブラでHEXファイル吐かせたら、
+;	HEX2BINとかでバイナリ作れば良い。
+;
+; 32000 Hz : 110 cycles per sample
+; 22050 Hz : 161 cycles per sample
+; 16000 Hz : 221 cycles per sample
+; 13400 Hz : 264 cycles per sample
+; 11025 Hz : 321 cycles per sample
+;  8000 Hz : 443 cycles per sample
+;
+;Z80メモリ 8KB
+;254サイクル/サンプル
+
+;---------------------------------------------------------------------
+A_SP:		EQU		2000h
+BANK:		EQU		6000h
+YM_REG:		EQU		4000h
+YM_DAT:		EQU		4001h
+PSG_PORT:	EQU		7F11h
+
+FMBUFF		EQU		$1A00			; 256byte(100H)
+FMBUFF_H	EQU		$1A
+FMBUFF_BH	EQU		$1D
+VOLTBL		EQU		$0A00			; 256byte(100H)
+VOLTBL_H	EQU		$0A
+PSGTBL		EQU		$1A00			; 768byte(300H)
+PSGTBL_H	EQU		$1A
+WAVBUFFER0  EQU		$1E00           ; WAV buffer 0
+WAVBUFFER1  EQU		$1F00           ; WAV buffer 1
+
+;---------------------------------------------------------------------
+		ORG	$0000
+		DI			;割り込み禁止
+		LD	SP, A_SP	;スタックポインタ初期化
+		IM	1		;割り込みMODE 1
+;;		EI
+		JP	INIT		;RESET
+
+;---------------------------------------------------------------------
+		BLOCK $0038-$
+		/*
+		PUSH HL
+		LD HL,(VSYNC_C)
+		INC HL
+		LD (VSYNC_C),HL
+		POP HL
+		EI
+		*/
+		RETI			;VSYNC割り込み
+
+;---------------------------------------------------------------------
+		BLOCK $50-$
+START1:			DW	0		//0x00
+NOW1:			DW	0		//0x02
+END1:			DW	0		//0x04
+PLAY1:			DB	0		//0x06
+				DB	0
+NOW_BANK:		DW	0		//0x08
+NOW_OFF:		DB	0		//0x0a
+NOW_LOOP:		DB	0		//0x0b
+NOW_END:		DB	0		//0x0c
+				DB	0
+NEXT_BANK:		DW	0		//0x0e
+NEXT_OFF:		DB	0		//0x10
+				DB	0
+END_BANK:		DW	0		//0x12
+END_OFF:		DB	0		//0x14
+				DB	0
+NOW_ADR:		DW	0		//0x16
+NEXT_NOW1:		DW	0		//0x18
+PLAY_MODE:		DB	6		//0x1a
+				DB	0
+NOW_END1:		DW	0		//0x1c
+VOL1:			DW	0		//0x1e
+FMOUT1:			DW	0		//0x20
+FMREAD1:		DW	0		//0x22
+ADD_L1:			DW	0		//0x24
+ADD_H1:			DW	0		//0x26
+NOW_TMP1:		DW	0		//0x28
+PAN1:			DW	3		//0x2A
+;---------------------------------------------------------------------
+		BLOCK $100-$
+INIT:	
+		LD	HL,FMBUFF
+		LD	(FMOUT1),HL
+		LD	(FMREAD1),HL
+;;		LD	A,3
+		LD	A,$c0
+		LD	(PAN1),A
+INIT_10:
+		LD	A,(PLAY1)
+		OR	A
+		JP	Z,INIT_10
+INIT_20:
+		JP	LOOP_600
+;---------------------------------------------------------------------
+;mode6 PSG再生(256バイトごと)
+LOOP_600:
+LOOP_601:
+		LD	A,-1
+		LD	(PLAY1),A
+		LD		HL,(START1+0)
+		LD		(NOW1+0),HL
+		LD		HL,(END1+0)
+		LD		(NOW_END1+0),HL
+LOOP_610:
+
+		LD	HL, BANK	;バンクセレクト
+		LD	A, (NOW1+0)
+		RLCA
+		LD	(HL), A		; bit 15
+		LD	A, (NOW1+1)	;
+		LD	(HL), A		; bit 16
+		RRA
+		LD	(HL), A		; bit 17
+		RRA
+		LD	(HL), A		; bit 18
+		RRA
+		LD	(HL), A		; bit 19
+		RRA
+		LD	(HL), A		; bit 20
+		RRA
+		LD	(HL), A		; bit 21
+		XOR	A			; 32Mカートリッジまでなら上位2bitは無視可能
+		LD	(HL), A		; bit 22
+		LD	(HL), A		; bit 23
+		
+LOOP_611:
+		LD		A,(NOW1+0)
+		LD		H,A
+		LD		L,0
+		SET		7,H
+		LD		A,(VOL1+0)
+		ADD		A,VOLTBL_H
+		LD		B,A
+LOOP_620:
+		LD		A,(HL)
+		LD		C,A
+		LD		A,(BC)
+		SUB		80h
+		LD		E,A
+		LD		D,PSGTBL_H
+		LD		A,(DE)
+		LD		(PSG_PORT),A
+		INC		D
+		LD		A,(DE)
+		LD		(PSG_PORT),A
+		INC		D
+		LD		A,(DE)
+		LD		(PSG_PORT),A
+		INC		HL
+		
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		
+		LD		A,L
+		OR		A
+		JP		NZ,LOOP_620
+		
+		LD	A,(PLAY1)
+		INC	A
+		JP	NZ,INIT_10
+		
+		
+		LD		HL,(NOW1+0)
+		INC		HL
+		LD		(NOW1+0),HL
+		LD		DE,(NOW_END1+0)
+		
+		LD		A,H
+		CP		D
+		JP		NZ,LOOP_610
+		LD		A,L
+		CP		E
+		JP		NZ,LOOP_610
+		
+		XOR	A
+		LD	(PLAY1),A
+		JP		INIT_10
+		
+		
+;-------------------------------------------------------------
+		DS		$100
+END	

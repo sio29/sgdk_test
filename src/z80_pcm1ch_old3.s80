@@ -1,0 +1,695 @@
+;---------------------------------------------------------------------
+;SOUND DRIVER (C) Minami Youichi 09.23.2008 - 10.04.2008
+;
+;使う人居るか知らんけど、このサウンドドライバの使い方:
+;	このコードを 0xA00000(Z80のRAMエリア)に転送したら、
+;	あとは鳴らしたい時に以下のシーケンスを実行すればOK。
+;
+;	1. 0xA00010 にPCMスタートアドレスをぶち込む
+;	2. 0xA00014 にPCMエンドアドレスをぶち込む
+;	3. 0xA00015 に 0x00 をぶち込む
+;
+;	スタートアドレスとエンドアドレスがバンクを跨いでいると死ぬ。
+;	なのでバンク(32KBytes単位)を跨がない範囲に揃える必要がある。
+;
+;	PCMのフォーマットはYM2151のDACデータそのまんま。
+;
+;アセンブルの仕方:
+;	Zilogスタンダードな書き方したつもり。
+;	ZASMとかアブソリュートアセンブラでHEXファイル吐かせたら、
+;	HEX2BINとかでバイナリ作れば良い。
+;
+; 32000 Hz : 110 cycles per sample
+; 22050 Hz : 161 cycles per sample
+; 16000 Hz : 221 cycles per sample
+; 13400 Hz : 264 cycles per sample
+; 11025 Hz : 321 cycles per sample
+;  8000 Hz : 443 cycles per sample
+;
+;Z80A (3.58MHz/NTSC、3.54MHz/PAL) 
+;Z80メモリ 8KB
+;254サイクル/サンプル
+;22050Hz 162
+;11025Hz 324
+
+;---------------------------------------------------------------------
+A_SP:		EQU		2000h
+BANK:		EQU		6000h
+YM_REG:		EQU		4000h
+YM_DAT:		EQU		4001h
+PSG_PORT:	EQU		7F11h
+
+FMBUFF		EQU		$1A00			; 256byte(100H)
+FMBUFF_H	EQU		$1A
+FMBUFF_BH	EQU		$1D
+VOLTBL		EQU		$0A00			; 256byte(100H)
+VOLTBL_H	EQU		$0A
+PSGTBL		EQU		$1A00			; 768byte(300H)
+PSGTBL_H	EQU		$1A
+WAVBUFFER0  EQU		$1E00			; WAV buffer 0
+WAVBUFFER0_H EQU	$1E				; WAV buffer 0
+WAVBUFFER1  EQU		$1F00			; WAV buffer 1
+
+;---------------------------------------------------------------------
+		ORG	$0000
+		DI			;割り込み禁止
+		LD	SP, A_SP	;スタックポインタ初期化
+		IM	1		;割り込みMODE 1
+;;		EI
+		JP	INIT		;RESET
+
+;---------------------------------------------------------------------
+		BLOCK $0038-$
+		/*
+		PUSH HL
+		LD HL,(VSYNC_C)
+		INC HL
+		LD (VSYNC_C),HL
+		POP HL
+		EI
+		*/
+		RETI			;VSYNC割り込み
+
+;---------------------------------------------------------------------
+;60 80 a0 c0 e0
+CNL0			EQU		$60
+CNL_IN_START	EQU		0	//3byte 入力:開始アドレス
+CNL_IN_END		EQU		3	//3byte 入力:終了アドレス
+CNL_IN_ADD_L	EQU		6	//2byte 入力:加算値Low
+CNL_IN_ADD_H	EQU		9	//2byte 入力:加算値High
+CNL_NOW_ADR		EQU		12	//3byte 現在のアドレス
+CNL_NOW_ADR_L	EQU		14	//3byte 現在のアドレス
+CNL_END_ADR		EQU		15	//3byte 終了アドレス
+CNL_ADD_L		EQU		18	//2byte 加算値Low
+CNL_ADD_H		EQU		21	//2byte 加算値High
+CNL_PLAY_FLG	EQU		24	//1byte 再生フラグ
+CNL_VOL			EQU		26	//1byte ボリューム
+CNL_NEXT_TMP	EQU		27	//1byte 次のアドレス(テンポラリ)
+//CNL_PLAY_FLG	EQU		28	//1byte 再生フラグ
+//CNL_NEXT_TMP	EQU		28	//1byte 次のアドレス(テンポラリ)
+CNL_SIZE		EQU		32	//サイズ
+
+;---------------------------------------------------------------------
+		BLOCK $50-$
+FMOUT1:			DW	0		//0x00
+FMREAD1:		DW	0		//0x02
+PAN1:			DW	3		//0x04
+				DW	0		//0x06
+				DW	0		//0x08
+				DW	0		//0x0a
+				DW	0		//0x0c
+				DW	0		//0x0e
+		
+;---------------------------------------------------------------------
+		BLOCK $100-$
+INIT:	
+		LD	HL,FMBUFF
+		LD	(FMOUT1),HL
+		LD	(FMREAD1),HL
+;;		LD	A,3
+		LD	A,$c0
+		LD	(PAN1),A
+INIT_10:
+		CALL FMOUTPUT
+		
+		LD	A,(CNL0+CNL_PLAY_FLG)
+		OR	A
+		JP	Z,INIT_10
+INIT_20:
+		JP	LOOP_100
+		
+;---------------------------------------------------------------------
+;	FMデータ出力
+;---------------------------------------------------------------------
+FMOUTPUT:
+;;		EXX
+		LD	BC,(FMOUT1)
+		LD	DE,(FMREAD1)
+FMOUTPUT_01:
+		LD		A,B
+		CP		D
+		JP		NZ,FMOUTPUT_02
+		LD		A,C
+		CP		E
+		JP		NZ,FMOUTPUT_02
+		
+		LD	(FMREAD1),DE
+		
+;;		EXX
+		RET
+FMOUTPUT_02:
+		LD	HL,YM_REG
+FMOUTPUT_03:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,FMOUTPUT_03
+		
+		LD	A,(DE)
+		INC	DE
+		ADD	A,A
+		LD	L,A
+		
+		LD	A,(DE)
+		INC	DE
+		LD	(HL), A
+		
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		
+FMOUTPUT_04:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,FMOUTPUT_03
+		
+		LD	A,(DE)
+		INC	DE
+		INC	HL
+		LD	(HL), A
+		
+		LD	A,D
+		CP	A,FMBUFF_BH
+		JP	NZ,FMOUTPUT_05
+		LD	D,FMBUFF_H
+FMOUTPUT_05:
+		
+		JP	FMOUTPUT_01
+		
+
+;---------------------------------------------------------------------
+;	PAN出力
+;---------------------------------------------------------------------
+PANOUT:
+PANOUT_01:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,PANOUT_01
+		
+		LD	A,0xb6
+		LD	(YM_REG+2),A
+		
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+PANOUT_02:
+		LD	A,(YM_REG)
+		BIT	7,A
+		JP	NZ,PANOUT_02
+		LD	A,(PAN1)
+;;		AND	3
+;;		RL	A
+;;		RL	A
+;;		RL	A
+;;		RL	A
+;;		RL	A
+;;		RL	A
+		LD	(YM_REG+3),A
+		RET
+;---------------------------------------------------------------------
+		;==========================
+		;ウェイト
+		;clock 16*n
+		;==========================
+		macro Wait n
+		LD		A,n
+.Wait_01
+		DEC		A				;4
+		JP		NZ,.Wait_01		;12
+		endm
+		;==========================
+		;PCM出力初期化
+		;clock 
+		;==========================
+		macro InitPcmOut
+		EXX						; 4
+		LD		H,WAVBUFFER0_H 
+		LD		L,0
+		LD		DE,YM_DAT
+		EXX						; 4
+		endm
+		;==========================
+		;PCM出力
+		;clock 33
+		;==========================
+		macro PcmOut
+		EXX						; 4
+		LD		A,(HL)			; 7 PCMデータ読み込み
+		INC		L				; 4
+		ADD		80h				; 7
+		LD		(DE), A			; 7 DACへ出力
+		EXX						; 4
+		endm
+		;==========================
+		;バンク切り替え
+		;clock 124
+		;==========================
+		macro SetBank
+		LD	HL, BANK		;10 バンクセレクト
+		LD	(HL), A			;10 bit 15
+		RRCA				;4
+		LD	(HL), A			;10 bit 16
+		RRCA				;4
+		LD	(HL), A			;10 bit 17
+		RRCA				;4
+		LD	(HL), A			;10 bit 18
+		RRCA				;4
+		LD	(HL), A			;10 bit 19
+		RRCA				;4
+		LD	(HL), A			;10 bit 20
+		RRCA				;4
+		LD	(HL), A			;10 bit 21
+		LD	(HL), L			;10 bit 22
+		LD	(HL), L			;10 bit 23
+		endm
+		
+		;==========================
+		;パラメータのフィードバック
+		;clock 165
+		;==========================
+		macro FeedbackParamCnl ch
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG)			;13
+		OR		A
+		JP		NZ,.FeedbackParamCnl_01
+		INC		A
+		JP		Z,.FeedbackParamCnl_02
+		; ** stop **
+		LD		A,-1										; 7 再生中フラグ
+		LD		((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG),A			;13
+		LD		HL,0
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_L+0),HL			;16
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_H+0),HL			;16
+		JP		.FeedbackParamCnl_02
+.FeedbackParamCnl_01
+		; ** play **
+		LD		A,-1										; 7 再生中フラグ
+		LD		((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG),A			;13
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_IN_START+0)		;16 再生位置獲得
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0),HL		;16
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_IN_END+0)		;16 終了位置獲得
+		LD		((CNL0+ch*CNL_SIZE)+CNL_END_ADR+0),HL		;16
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_IN_ADD_L+0)		;16
+		
+	LD L,0
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_L+0),HL			;16
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_IN_ADD_H+0)		;16
+		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_H+0),HL			;16
+		XOR		A											; 4
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR_L+0),A		;13
+		
+;;		LD		HL,0
+;;		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_L+0),HL			;16
+;;		LD		((CNL0+ch*CNL_SIZE)+CNL_ADD_H+0),HL			;16
+.FeedbackParamCnl_02
+		endm
+		
+		;==========================
+		;ループ前処理
+		;clock 
+		;==========================
+		macro PrevLoopCnl ch
+		LD	A, ((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+1)			;13
+		SetBank												;124
+		;
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0)		;13   HL PCMアドレス
+		LD		H,A											; 4 
+		INC		A											; 4 次のバンクアドレス
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NEXT_TMP+0),A		;13 
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR_L+0)		;13 
+		LD		L,A											; 4
+		
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_VOL+0)			;13 ボリュームテーブル獲得
+		;;ADD		A,VOLTBL_H									; 4
+		LD		B,A											; 4
+		
+		LD		IX,0										;14 小数点部分クリア
+		LD		IYL,0										; 8
+		endm
+		
+		;==========================
+		;ループ中処理
+		;clock 166
+		;==========================
+		macro LoopBodyCnl ch
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_VOL+0)			;13  ボリュームテーブル獲得
+		LD		B,A											; 4 
+		LD		C,(HL)										; 7 PCMデータ読み込み
+		LD		A,(BC)										; 7 ボリューム変換
+		LD		(DE),A										; 7
+		INC		E											; 4
+		
+		LD		BC,((CNL0+ch*CNL_SIZE)+CNL_ADD_L)			;20 アドレス小数点部分の加算
+		ADD		IX,BC										;15 
+		LD		BC,((CNL0+ch*CNL_SIZE)+CNL_ADD_H)			;20 アドレス整数部分の加算
+		ADC		HL,BC										;15 
+		
+		LD	A,((CNL0+ch*CNL_SIZE)+CNL_NEXT_TMP+0)			;13 256byte分処理したか?
+		CP	H												; 4 
+		CALL Z,BANK_CHARER									;10 
+		
+		LD	A,((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG)				;13 停止か?
+		INC	A												; 4
+		;;JP	NZ,INIT_10									;10 
+		
+		endm
+		
+		
+		;;LD	A,IXH											;8
+		;;ADD	A,((CNL0+ch*CNL_SIZE)+CNL_ADD_L+1)				;8
+		;;LD	IXH,A											;8
+		
+		
+		;==========================
+		;ループ後処理
+		;clock 
+		;==========================
+		macro PostLoopCnl ch
+		LD	A,H
+		LD	((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0),A
+		LD	A,L
+		LD	((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR_L+0),A
+		
+		LD	A,((CNL0+ch*CNL_SIZE)+CNL_PLAY_FLG)				;停止か?
+		INC	A
+		JP	NZ,INIT_10
+;;		JP	NZ,CNL_STOP
+		endm
+		
+		;==========================
+		;バンクチェック
+		;clock 
+		;==========================
+		macro BankCheckCnl ch
+		LD		HL,((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0)			;+100h
+		INC		L							;low+1
+		LD		A,L							;<80Hになった?
+		OR		A
+		JP		NZ,.BANK_CHARER_01
+		LD		L,80h						;low=80H
+		INC		H							;high++
+.BANK_CHARER_01
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0),HL
+		LD		DE,((CNL0+ch*CNL_SIZE)+CNL_END_ADR+0)		;PCM終了?
+		
+		LD		A,H
+		CP		D
+		JP		NZ,BANK_CHARER_02
+		LD		A,L
+		CP		E
+		JP		NZ,BANK_CHARER_02
+		
+		POP		HL							;CALL STACK POP
+		JP		CNL_STOP
+.BANK_CHARER_02
+		LD	A, ((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+1)			;同じバンク?
+		CP	A,H
+		JP	Z,BANK_CHARER_03
+		SetBank
+.BANK_CHARER_03
+		LD		A,((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR+0)
+		LD		H,A
+		
+		INC		A				;次のバンクアドレス
+		LD		((CNL0+ch*CNL_SIZE)+CNL_NEXT_TMP+0),A
+		
+		LD		A,0;((CNL0+ch*CNL_SIZE)+CNL_NOW_ADR_L+0)
+		LD		L,A
+		//JP		LOOP_112
+		RET
+		endm
+		
+		
+		;==========================
+		;バンクチェック
+		;202/49=4.48
+		;clock 49
+		;==========================
+		macro MixFixPcmCnl ch
+		;;LD		B,VOLTBL_H+15				; 7
+		LD		A,(DE)						; 7 PCMデータ読み込み
+		LD		C,A							; 4
+		LD		A,(BC)						; 7 ボリューム変換
+		INC		DE							; 6
+		ADD		A,(HL)						; 7
+		JP		PO,.FixPcmCnl_01			; 7
+		LD		A,80H						;
+		ADC		A,$FF						;
+.FixPcmCnl_01
+		LD		(HL),A						; 7
+		INC		L							; 4
+		endm
+		
+		
+;---------------------------------------------------------------------
+;mode1 そのまま再生(256バイトごと)
+LOOP_100:
+		CALL	PANOUT
+LOOP_101:
+		FeedbackParamCnl 0
+		FeedbackParamCnl 1
+		FeedbackParamCnl 2
+		FeedbackParamCnl 3
+LOOP_110:
+		LD	A, 2Bh		;FM6無効, PCM有効
+		LD	(YM_REG), A
+		LD	A, 80h
+		LD	(YM_DAT), A
+		LD	A, 2Ah		;PCMデータレジスタを選択
+		LD	(YM_REG), A
+		
+		LD	A, (CNL0+CNL_NOW_ADR+1)
+		SetBank
+		;
+		LD		A,(CNL0+CNL_NOW_ADR+0)		;HL PCMアドレス
+		LD		H,A
+		INC		A				;次のバンクアドレス
+		LD		(CNL0+CNL_NEXT_TMP+0),A
+		LD		A,(CNL0+CNL_NOW_ADR_L+0)
+		LD		L,A
+		
+		LD		A,(CNL0+CNL_VOL+0)			;13 ボリュームテーブル獲得
+		;;ADD		A,VOLTBL_H
+		LD		B,A
+		
+		LD		IX,0			;小数点部分クリア
+		LD		IYL,0
+		
+		LD		IYH,0
+		LD		A,(CNL0+CNL_ADD_L+1)
+		LD		IXL,A
+		LD		A,(CNL0+CNL_ADD_H+0)
+		LD		IXH,A
+		
+		LD		A,(CNL0+CNL_VOL+0)			;13 ボリュームテーブル獲得
+		LD		(PG_VOL1+1),A
+		LD		A,(CNL0+CNL_ADD_L+1)
+		LD		(PG_ADD_L1+1),A
+		LD		A,(CNL0+CNL_ADD_H+0)
+		LD		(PG_ADD_H1+1),A
+		LD		A,(CNL0+CNL_NEXT_TMP+0)
+		LD		(PG_NEXT_TMP1+1),A
+		
+		;280
+LOOP_111:
+		;@ 101+16=127 : 101*2+16=218+33=251
+		;162
+		;186
+		;---
+		
+		;@ 32
+;;		LD		A,(CNL0+CNL_VOL+0)			;13 ボリュームテーブル獲得
+;;		LD		B,A							; 4
+PG_VOL1:
+		LD		B,VOLTBL_H+15				; 7
+		LD		C,(HL)						; 7 PCMデータ読み込み
+		LD		A,(BC)						; 7 ボリューム変換
+		ADD		80h
+		LD		(YM_DAT), A					;DACへ出力
+		
+		;LD		(DE),A						; 7
+		;INC		E						; 4
+		
+;;		ADD		A,IXH
+;;		ADD		A,
+		
+		;@ 48
+		LD		A,IYH						; 8
+PG_ADD_L1:
+		ADD		A,0							; 7
+		LD		IYH,A						; 8
+PG_ADD_H1:
+		LD		BC,0						;10
+		ADC		HL,BC						;15
+		
+		;50
+;;		LD		A,IXL						; 8
+;;		ADD		A,IYH						; 8
+;;		LD		IYH,A						; 8
+;;		LD		B,0							; 7
+;;		LD		C,IXH						; 4
+;;		ADC		HL,BC						;15
+		
+		;70
+;;		LD		DE,(CNL0+CNL_ADD_L)			;20 アドレス小数点部分の加算
+;;		ADD		IX,DE						;15
+;;		LD		DE,(CNL0+CNL_ADD_H)			;20 アドレス整数部分の加算
+;;		ADC		HL,DE						;15
+		
+		;@ 21
+PG_NEXT_TMP1:
+;;		LD	A,(CNL0+CNL_NEXT_TMP+0)			;13 256byte分処理したか?
+		LD	A,0								; 7 256byte分処理したか?
+		CP	H								; 4
+		CALL Z,BANK_CHARER					;10 
+		
+		LD	A,(CNL0+CNL_PLAY_FLG)			;13 停止か?
+		INC	A								; 4
+;;		JP	NZ,INIT_10						;10
+		JP	NZ,CNL_STOP_OR_PLAY				;10
+		
+;;LOOP_112:
+		; 4*26=104
+;;		NOP									;4
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+;;		NOP
+		;;Wait 6
+		Wait 10
+		
+		;@ 16
+		DEC IYL							; 4
+		JP NZ,LOOP_111					;7/12
+		LD	A,H
+		LD	(CNL0+CNL_NOW_ADR+0),A
+		LD	A,L
+		LD	(CNL0+CNL_NOW_ADR_L+0),A
+		
+		LD	A,(CNL0+CNL_PLAY_FLG)				;停止か?
+;;		OR	A
+;;		JP	Z,CNL_STOP_OR_PLAY
+		INC	A
+		JP	NZ,CNL_STOP_OR_PLAY
+;;		JP	NZ,CNL_STOP
+		
+		
+		CALL	FMOUTPUT			;FMデータ出力へ
+		
+		
+		JP LOOP_110
+		
+CNL_STOP_OR_PLAY:
+		;;LD	HL,0
+		;;LD		(CNL0+CNL_ADD_L),HL
+		;;LD		(CNL0+CNL_ADD_H),HL
+		
+		JP		INIT_10
+CNL_STOP:
+		XOR	A						;再生停止フラグ
+		LD	(CNL0+CNL_PLAY_FLG),A
+		
+		LD	HL,0
+		LD		(CNL0+CNL_ADD_L),HL
+		LD		(CNL0+CNL_ADD_H),HL
+		
+		JP		INIT_10
+		
+	;===========================================
+	;
+	;===========================================
+BANK_CHARER:
+		LD		HL,(CNL0+CNL_NOW_ADR+0)			;+100h
+		INC		L							;low+1
+		LD		A,L							;<80Hになった?
+		OR		A
+		JP		NZ,BANK_CHARER_01
+		LD		L,80h						;low=80H
+		INC		H							;high++
+BANK_CHARER_01:
+		LD		(CNL0+CNL_NOW_ADR+0),HL
+		LD		DE,(CNL0+CNL_END_ADR+0)		;PCM終了?
+		
+		LD		A,H
+		CP		D
+		JP		NZ,BANK_CHARER_02
+		LD		A,L
+		CP		E
+		JP		NZ,BANK_CHARER_02
+		
+		POP		HL							;CALL STACK POP
+		JP		CNL_STOP
+		//JP		CNL_STOP_OR_PLAY
+BANK_CHARER_02:
+		LD	A, (CNL0+CNL_NOW_ADR+1)			;同じバンク?
+		CP	A,H
+		JP	Z,BANK_CHARER_03
+		
+		SetBank
+		
+BANK_CHARER_03:
+		LD		A,(CNL0+CNL_NOW_ADR+0)
+		LD		H,A
+		
+		INC		A				;次のバンクアドレス
+		LD		(CNL0+CNL_NEXT_TMP+0),A
+		
+		LD		A,0;(CNL0+CNL_NOW_ADR_L+0)
+		LD		L,A
+		
+
+		//JP		LOOP_112
+		RET
+		
+;-------------------------------------------------------------
+		DS		$100
+END	
